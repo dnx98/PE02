@@ -1,0 +1,841 @@
+//versão 1.2 - ultima modificação 09/09/2025 as 17:00 na f2
+//bibliotecas
+#include <PCF8574.h>            //saídas
+#include <Adafruit_PCF8575.h>   //entradas
+#include <Wire.h>               //I2C
+#include <AT24Cxx.h>            //eeprom
+#include <LiquidCrystal_I2C.h>  //lcd
+#include <Arduino.h>            //watchdog
+#include "RTClib.h"             //RTC
+#include <WiFi.h>               //WiFi
+#include <PubSubClient.h>       //MQTT
+#include <WebServer.h>          //OTA
+#include <Update.h>             //OTA
+
+// variáveis de controle de ciclo
+unsigned long contadorCiclos = 0;
+bool cicloContado = false;
+
+//variáveis auxiliares
+bool bimanualArmado = false;  // só permite acionar após soltar os dois botões
+bool valvula_Pneumatica_Ativada = false;
+bool torre_vermelha_ativa = false;
+bool torre_verde_ativa = false;
+bool estado_disjuntor_motor = false;
+bool estado_botao_emergencia = false;
+bool estado_porta_seguranca = false;
+bool estado_operacao = false;
+bool display_atualizou = false;
+uint8_t lastMinute = 255;
+unsigned long contagem_anterior = false;
+bool enviaMQTT = true;
+bool estado_sirene = false;
+static bool estado_anterior_operacao = false;
+
+//variáveis da lógica bimanual
+unsigned long tempoBotao1 = 0;
+unsigned long tempoBotao2 = 0;
+const unsigned long TEMPO_LIMITE = 1000; // tempo permissivo entre acionamento bimanual
+//estado anterior dos botões (para detectar borda)
+bool prevEstadoBotao1 = false;
+bool prevEstadoBotao2 = false;
+
+//Variáveis para controle do Reset da EEPROM
+bool prevEstadoEnter = HIGH;
+bool prevEstadoEsc = HIGH;
+unsigned long tempoInicioEsc = 0;
+unsigned long tempoInicioEnter = 0;
+bool escZerou = false;
+
+// Credenciais Wi-Fi Local
+const char* nomeRede    = "teste" ;
+const char* senhaRede   = "22324252" ;
+bool wifiConectado = false;
+
+// Configuração MQTT
+const char* servidorMqtt  = "test.mosquitto.org"; // ou teu broker
+const uint16_t portaMqtt  = 1883;
+const char* topicoDados   = "consilos/pe02/dados";
+const char* topicoFalhas  = "consilos/pe02/falhas";
+const char* topicoEstado  = "consilos/pe02/estado";
+const char* idClienteMqtt = "QC_MONITOR_PE02";
+bool mqttConectado = false;
+bool mqtt_estado_operacao = false;
+
+// Configurações do modo AP para OTA
+const char* ota_ssid     = "ATUALIZAR_PE_02";
+const char* ota_password = "12345678";
+bool OTA_ativado = false;
+
+//controle de timeout
+const unsigned long TIMEOUT_WIFI = 15000;  // 15s
+const unsigned long TIMEOUT_MQTT = 15000;  // 20s
+
+// CONFIGURAÇÃO DE PINOS DE ENTRADA
+const int PINO_DISJUNTOR_MOTOR = 1; //0
+const int PINO_BOTAO1 = 3; //1
+const int PINO_BOTAO2 = 4;//2
+const int PINO_BOTAO_EMERGENCIA = 5;//3
+const int PINO_PORTA_SEGURANCA = 0;//4
+const int PINO_ESTADO_OPERACAO = 2;//5
+
+
+//CONFIGURAÇÃO PINOS QC MONITOR
+const int BOTAO_SOBE   = 13;       //SILENCIA A SIRENE DA TORRE LUMINOSA
+const int BOTAO_DESCE  = 14;       //ENTRA EM MODO ATUALIZAÇÃO QUANDO INICIADO PRESSIONADO
+const int BOTAO_ESC = 4;           //RESETA CONTADOR SE SEGURADO POR 2 SEGUNDOS
+const int BOTAO_ENTER = 0;         //REINICIA SISTEMA SE SEGURADO POR 2 SEGUNDOS
+
+// CONFIGURAÇÃO DE PINOS DE SAÍDA
+const int PINO_VALVULA_PNEUMATICA = 7;//1
+const int PINO_TORRE_SIRENE = 4;
+const int PINO_TORRE_VERMELHO = 5;//5
+const int PINO_TORRE_VERDE = 6;//6
+
+//instâncias
+PCF8574 pcfsaidas(0x3A);              //SAÍDAS     // PCF8574T = 0x22 // PCF8574A = 0x3A
+Adafruit_PCF8575 pcf;                 //ENTRADAS
+typedef AT24Cxx EEPROMClass;          //EEPROM
+EEPROMClass eeprom(0x50);             //EEPROM
+LiquidCrystal_I2C lcd(0x3F, 20, 4);   //DISPLAY    // PCF8574T = 0x27 // PCF8574A = 0x3F
+RTC_DS3231 rtc;                       //REAL TIME CLOCK
+WiFiClient     clienteWifi;              //MQTT
+PubSubClient   clienteMqtt(clienteWifi); //MQTT
+WebServer servidorOTA(80);               //OTA
+   
+//protótipo de funções
+void contarCiclo();
+void monitorarFalhas();
+static void eepromLerBytes(uint16_t endereco, uint8_t* buffer, size_t tamanho);
+static void eepromGravarBytes(uint16_t endereco, const uint8_t* buffer, size_t tamanho);
+uint32_t lerContadorEEPROM();
+void gravarContadorEEPROM(uint32_t contador);
+void ativaValvula();
+void desativaValvula();
+void AtivaTorreVermelho();
+void DesativaTorreVermelho();
+void conectarWiFiEMqtt();
+void startOTA();
+void monitoraMQTT();
+
+inline void safeStopValvula() {
+  if (valvula_Pneumatica_Ativada) {
+    desativaValvula();
+    valvula_Pneumatica_Ativada = false;
+  }
+  // zera estados para não “herdar” borda antiga
+  bimanualArmado = false;
+  prevEstadoBotao1 = false;
+  prevEstadoBotao2 = false;
+}
+
+
+void setup() {
+// inicializando dispositivos
+Wire.begin();
+pcf.begin(0x26, &Wire);
+pcfsaidas.begin();
+
+rtc.begin();
+//rtc.adjust(DateTime(F(__DATE__), F(__TIME__))); // CORRIGE DATA E HORA SE PERDER ENERGIA DA BATERIA
+Serial.begin(115200);
+
+//definindo pinos
+pcfsaidas.write(PINO_VALVULA_PNEUMATICA, LOW);
+pcfsaidas.write(PINO_TORRE_VERMELHO, LOW);
+pcfsaidas.write(PINO_TORRE_VERDE, LOW);
+
+DesativaTorreVermelho();
+
+pinMode(BOTAO_SOBE,  INPUT_PULLUP);
+pinMode(BOTAO_DESCE, INPUT_PULLUP);
+pinMode(BOTAO_ESC, INPUT_PULLUP);
+pinMode(BOTAO_ENTER, INPUT_PULLUP);
+
+//iniciando display
+lcd.init();
+lcd.backlight();
+lcd.clear();
+display_atualizou = true;
+
+ 
+
+  if (digitalRead(BOTAO_DESCE) == LOW) {
+    startOTA();
+    OTA_ativado = true;
+  }else{
+
+
+//ler eeprom 
+contadorCiclos = lerContadorEEPROM();
+
+// conectar Wi-Fi e MQTT com timeout
+conectarWiFiEMqtt();
+// Configura MQTT
+clienteMqtt.setServer(servidorMqtt, portaMqtt);
+
+//DesativaTorreVermelho();
+
+  }
+  // Obtém e imprime o endereço MAC
+  String mac = WiFi.macAddress();
+  Serial.println("Endereco MAC do ESP32: " + mac);
+}//--------------------------------------------------------------------------------------------
+
+void loop() {
+   
+   estado_disjuntor_motor = pcf.digitalRead(PINO_DISJUNTOR_MOTOR);
+   estado_botao_emergencia = pcf.digitalRead(PINO_BOTAO_EMERGENCIA);
+   estado_porta_seguranca = pcf.digitalRead(PINO_PORTA_SEGURANCA);
+   estado_operacao = pcf.digitalRead(PINO_ESTADO_OPERACAO);
+   monitorarFalhas();
+
+// Intertravamentos (true = tudo ok)
+bool interlock_ok =
+      estado_operacao              // máquina em operação
+   &&  estado_porta_seguranca      // porta fechada (seu NF -> true = ok)
+   &&  estado_botao_emergencia     // emergência desacionada (NF -> true = ok)
+   && !estado_disjuntor_motor      // disjuntor ok (false = ok)
+   && !torre_vermelha_ativa        // sem falha geral
+   && !OTA_ativado;                // em OTA a válvula deve ficar sempre off
+
+// Se qualquer interlock falhar, derruba a válvula imediatamente
+if (!interlock_ok) {
+  safeStopValvula();
+}
+
+  //condição de entrada se modo OTA 
+  if(OTA_ativado){
+    safeStopValvula();  
+      servidorOTA.handleClient();
+  delay(10);
+
+  return;
+  }
+    if (digitalRead(BOTAO_SOBE) == LOW) {
+    estado_sirene = true;
+    pcfsaidas.write(PINO_TORRE_SIRENE, LOW);
+  }
+
+  // se MQTT conectado, mantém alive
+  if (mqttConectado) {
+    clienteMqtt.loop();
+  }
+
+//Timer auxiliar para controle bimanual
+unsigned long timerbimanual = millis();
+
+// INÍCIO DO CONTROLE BIMANUAL
+if(!torre_vermelha_ativa && estado_operacao){
+// 1) Lê os estados atuais
+bool estadoBotao1 = pcf.digitalRead(PINO_BOTAO1);
+bool estadoBotao2 = pcf.digitalRead(PINO_BOTAO2);
+
+if (!estadoBotao1 && !estadoBotao2) {
+  bimanualArmado = true;   // só arma quando soltar os dois
+}
+
+if (interlock_ok) {
+
+// 2) Borda de subida em Botao1
+if (estadoBotao1 && !prevEstadoBotao1) {
+tempoBotao1 = timerbimanual;
+Serial.println(">> B1 subiu");
+}
+// 3) Borda de subida em Botao2
+if (estadoBotao2 && !prevEstadoBotao2) {
+tempoBotao2 = timerbimanual;
+Serial.println(">> B2 subiu");
+}
+// 4) Lógica bimanual
+if (bimanualArmado && estadoBotao1 && estadoBotao2) {
+// só tenta ativar se ainda não estiver ativada
+if (!valvula_Pneumatica_Ativada) {
+unsigned long diferenca = (tempoBotao1 > tempoBotao2)
+? (tempoBotao1 - tempoBotao2)
+: (tempoBotao2 - tempoBotao1);
+
+if (diferenca <= TEMPO_LIMITE) {
+ativaValvula();
+valvula_Pneumatica_Ativada = true;
+cicloContado = false; // reseta variável
+  }
+ }
+}
+
+// 5) Qualquer botão for solto → desliga
+else {
+if (valvula_Pneumatica_Ativada) {
+desativaValvula();
+valvula_Pneumatica_Ativada = false;
+// conta o ciclo apenas se ainda não foi contado neste ciclo
+if (!cicloContado) {
+contarCiclo();
+  }
+ }
+}
+}
+// 6) Atualiza estados anteriores
+prevEstadoBotao1 = estadoBotao1;
+prevEstadoBotao2 = estadoBotao2;//FIM DO CONTROLE BIMANUAL
+}
+//-------------- controle de reset da eeprom ----------------
+
+//timer auxiliar para 2 seg ESC/EEPROM
+unsigned long tempoEsc = millis();
+
+// --- checa ESC longo (2 s) para zerar o contador ---
+bool estadoEsc = digitalRead(BOTAO_ESC);
+
+// ao apertar (borda HIGH→LOW), anota o tempo
+if (prevEstadoEsc == HIGH && estadoEsc == LOW) {
+tempoInicioEsc = tempoEsc;
+}
+
+// se mantém pressionado por ≥2000 ms e ainda não zerou
+if (estadoEsc == LOW && !escZerou && (tempoEsc - tempoInicioEsc) >= 2000) {
+// zera contador e EEPROM
+contadorCiclos = 0;
+gravarContadorEEPROM(0);
+lcd.clear();
+lcd.setCursor(0,1);
+lcd.print("  Ciclo Resetado!");
+delay(2000);
+display_atualizou = true;
+}
+
+// ao soltar (borda LOW→HIGH), libera para próximo reset
+if (prevEstadoEsc == LOW && estadoEsc == HIGH) {
+escZerou = false;
+}
+prevEstadoEsc = estadoEsc;
+
+//--------------- fim do controle de reset da eeprom ------------------
+
+//controle de reset do sistema após dois segundos segurado o enter
+unsigned long tempoEnter = millis();
+// --- checa ENTER longo (2 s) para reset ---
+bool estadoEnter = digitalRead(BOTAO_ENTER);
+
+// ao apertar (borda HIGH→LOW), anota o tempo
+if (prevEstadoEnter == HIGH && estadoEnter == LOW) {
+tempoInicioEnter = tempoEnter;
+}
+
+// se mantém pressionado por ≥2000 ms e ainda não zerou
+if (estadoEnter == LOW && (tempoEnter - tempoInicioEnter) >= 2000) {
+// inicia reset
+lcd.clear();
+lcd.setCursor(0,1);
+lcd.print("   Reiniciando...");
+lcd.setCursor(0,3);
+lcd.print("     Aguarde!    ");
+delay(2000);
+ESP.restart();
+}
+prevEstadoEnter = estadoEnter;
+//----------------------------------------------------------------------
+
+
+  // Lê a hora atual
+  DateTime now = rtc.now();
+
+  // Se mudou de minuto, sinaliza atualização
+  if (now.minute() != lastMinute) {
+    lastMinute = now.minute();
+    display_atualizou = true;
+  }
+monitoraMQTT();
+
+if(estado_operacao != estado_anterior_operacao){
+  display_atualizou = true;
+  estado_anterior_operacao = estado_operacao;
+}
+
+amostragem_display();
+
+
+if (estado_anterior_operacao && !estado_operacao) { // caiu de 1 -> 0
+bimanualArmado = false;
+  safeStopValvula();
+}
+
+if (!torre_vermelha_ativa) {
+  pcfsaidas.write(PINO_TORRE_VERDE, estado_operacao ? HIGH : LOW);
+  torre_verde_ativa = estado_operacao;
+}
+
+//estado_anterior_operacao = estado_operacao;
+
+delay(10);  // folga no loop
+
+
+}
+//------------------------- FIM DO LOOP --------------------------------
+void contarCiclo() {
+// 1) Incrementa o contador
+contadorCiclos++;
+// 2) Persiste na EEPROM externa
+gravarContadorEEPROM(contadorCiclos);
+
+// 3) Marca flag de contagem
+cicloContado = true;
+
+// 4) Debug em serial
+Serial.print("Ciclo contado! Total: ");
+Serial.println(contadorCiclos);
+
+// 5) Atualiza display 
+display_atualizou = true;
+}//--------------------------------------
+void exibirOutraFalhaAtiva() {
+
+  if (estado_disjuntor_motor) {
+
+    lcd.setCursor(0,0); lcd.print("------ FALHA ------");
+    lcd.setCursor(0,1); lcd.print(" Falha no Disjuntor");
+    lcd.setCursor(0,2); lcd.print(" do Motor da Prensa");
+    lcd.setCursor(0,3); lcd.print("       [Q-01]     ");
+  }
+  else if (!estado_botao_emergencia) {
+
+    lcd.setCursor(0,0); lcd.print("------ FALHA ------");
+    lcd.setCursor(0,1); lcd.print("Botao de Emergencia");
+    lcd.setCursor(0,2); lcd.print("     Acionado!     ");
+    lcd.setCursor(0,3); lcd.print("    [BT-EMERG]  ");
+  }
+  else if (!estado_porta_seguranca) {
+
+    lcd.setCursor(0,0); lcd.print("------ FALHA ------");
+    lcd.setCursor(0,1); lcd.print(" Porta de Seguranca");
+    lcd.setCursor(0,2); lcd.print("       Aberta!     ");
+    lcd.setCursor(0,3); lcd.print("       [RI-04]    ");
+  }
+  // se nenhuma estiver ativa, volta à tela normal
+}
+void monitorarFalhas() {
+
+  static bool falha_anterior_disj    = false;
+  static bool falha_anterior_emerg   = true;
+  static bool falha_anterior_porta   = true;
+
+  // — DISJUNTOR —
+  if (estado_disjuntor_motor != falha_anterior_disj) {
+    if (estado_disjuntor_motor) {
+  
+      lcd.clear();
+      lcd.setCursor(0,0); lcd.print("------ FALHA ------");
+      lcd.setCursor(0,1); lcd.print(" Falha no Disjuntor");
+      lcd.setCursor(0,2); lcd.print(" do Motor da Prensa");
+      lcd.setCursor(0,3); lcd.print("       [Q-01]");
+    }
+    else {
+      // se resolver disjuntor, roda exibirOutraFalhaAtiva(); pra atualizar na tela se outra falha estiver ativa 
+      exibirOutraFalhaAtiva();
+    }
+    enviaMQTT = true;
+    display_atualizou = true;
+    falha_anterior_disj = estado_disjuntor_motor;
+  }
+
+  // — EMERGÊNCIA —
+  if (estado_botao_emergencia != falha_anterior_emerg) {
+    if (!estado_botao_emergencia) {
+      lcd.clear();
+      lcd.setCursor(0,0); lcd.print("------ FALHA ------");
+      lcd.setCursor(0,1); lcd.print("Botao de Emergencia");
+      lcd.setCursor(0,2); lcd.print("     Acionado!");
+      lcd.setCursor(0,3); lcd.print("      [BT-EMERG]");
+    }
+    else {
+      exibirOutraFalhaAtiva();
+    }
+    enviaMQTT = true;
+    display_atualizou = true;
+    falha_anterior_emerg = estado_botao_emergencia;
+  }
+
+  // — PORTA DE SEGURANÇA —
+  if (estado_porta_seguranca != falha_anterior_porta) {
+    if (!estado_porta_seguranca) {
+      lcd.clear();
+      lcd.setCursor(0,0); lcd.print("------ FALHA ------");
+      lcd.setCursor(0,1); lcd.print(" Porta de Seguranca");
+      lcd.setCursor(0,2); lcd.print("       Aberta!");
+      lcd.setCursor(0,3); lcd.print("       [RI-04]");
+    }
+    else {
+      exibirOutraFalhaAtiva();
+    }
+    enviaMQTT = true;
+    display_atualizou = true;
+    falha_anterior_porta = estado_porta_seguranca;
+  }
+
+  // — torre/sirene  —
+  if (estado_disjuntor_motor || !estado_botao_emergencia || !estado_porta_seguranca) {
+    if (!torre_vermelha_ativa) {
+      AtivaTorreVermelho();
+      estado_sirene = false;
+    }
+  } else {
+    if (torre_vermelha_ativa) {
+      DesativaTorreVermelho();
+    }
+  }
+}
+
+// Lê um bloco de bytes da EEPROM
+static void eepromLerBytes(uint16_t endereco, uint8_t* buffer, size_t tamanho) {
+for (size_t i = 0; i < tamanho; i++) {
+buffer[i] = eeprom.read(endereco + i);
+delay(10);  // respeito do tempo de acesso (datasheet 24LC512)
+ }
+}//---------------------------------------------------------------------------------------
+
+// Grava em até 16 bytes por vez, reduzindo drasticamente atrasos
+static void eepromGravarBytes(uint16_t endereco, const uint8_t* buffer, size_t tamanho) {
+const size_t TAMANHO_PAGINA = 16;  // 16 bytes por ciclo de escrita
+size_t posicao = 0;
+
+while (posicao < tamanho) {
+// Quantos bytes ainda faltam gravar?
+size_t restante = tamanho - posicao;
+// Limita ao tamanho da página
+size_t bytesNaPagina = restante < TAMANHO_PAGINA ? restante : TAMANHO_PAGINA;
+Wire.beginTransmission(0x50);
+// envia endereço de 16 bits (MSB, LSB)
+Wire.write((uint8_t)((endereco + posicao) >> 8));
+Wire.write((uint8_t)((endereco + posicao) & 0xFF));
+// envia o bloco de até 16 bytes
+Wire.write(buffer + posicao, bytesNaPagina);
+Wire.endTransmission();
+// aguarda ciclo de escrita interno (~5 ms é suficiente)
+delay(5);
+posicao += bytesNaPagina;
+  }
+}//----------------------------------------------------------------
+
+// Lê o valor do contador salvo na EEPROM (4 bytes, little-endian)
+uint32_t lerContadorEEPROM() {
+uint8_t dados[4];
+eepromLerBytes(1, dados, sizeof(dados)); // endereço 1
+// montando uint32_t little-endian
+return (uint32_t)dados[0]
+| ((uint32_t)dados[1] << 8)
+| ((uint32_t)dados[2] << 16)
+| ((uint32_t)dados[3] << 24);
+}//----------------------------------------------------------------
+
+// Grava o valor do contador na EEPROM (4 bytes, little-endian)
+void gravarContadorEEPROM(uint32_t contador) {
+uint8_t dados[4] = {
+(uint8_t)(contador & 0xFF),
+(uint8_t)((contador >> 8) & 0xFF),
+(uint8_t)((contador >> 16) & 0xFF),
+(uint8_t)((contador >> 24) & 0xFF)
+};
+eepromGravarBytes(1, dados, sizeof(dados)); //endereço 1
+}//----------------------------------------------------------
+
+void ativaValvula() {
+pcfsaidas.write(PINO_VALVULA_PNEUMATICA, HIGH);
+Serial.println("Valvula Ativada");
+}//----------------------------------------------
+
+void desativaValvula() {
+pcfsaidas.write(PINO_VALVULA_PNEUMATICA, LOW);
+Serial.println("Valvula Desativada");
+}//---------------------------------------------
+
+void AtivaTorreVermelho(){
+  if(!torre_vermelha_ativa){
+    pcfsaidas.write(PINO_TORRE_VERMELHO, HIGH);
+    pcfsaidas.write(PINO_TORRE_VERDE, LOW);   // verde sempre off quando vermelho
+    torre_vermelha_ativa = true;
+    torre_verde_ativa    = false;   
+    pcfsaidas.write(PINO_TORRE_SIRENE, HIGH);
+    estado_sirene = true;
+    Serial.println("Torre Vermelho Ativado");
+  }
+}
+
+void DesativaTorreVermelho(){
+  pcfsaidas.write(PINO_TORRE_VERMELHO, LOW);
+  // Verde acompanha diretamente o estado de operação
+  pcfsaidas.write(PINO_TORRE_VERDE, estado_operacao ? HIGH : LOW);
+  torre_vermelha_ativa = false;
+  torre_verde_ativa    = estado_operacao;
+  pcfsaidas.write(PINO_TORRE_SIRENE, LOW);
+  estado_sirene = false;
+  Serial.println("Torre Vermelho Desativado");
+}//----------------------------------------------
+void amostragem_display(){
+  if (display_atualizou && !torre_vermelha_ativa){
+    // Limpa tudo e desenha título na 1ª linha
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("  CONSILOS [PE-02]  ");
+    
+    lcd.setCursor(0, 1);
+    if(estado_operacao){
+      mqtt_estado_operacao = true;
+    lcd.print("     EM OPERACAO");
+
+    }else{
+    lcd.print("     MAQ. PARADA");
+
+     mqtt_estado_operacao = true;
+    }
+
+    // Lê data/hora e temperatura
+    DateTime now = rtc.now();
+
+    // Linha 4 (índice 3): teu ciclo
+    lcd.setCursor(5, 2);
+    lcd.print("Ciclo:");
+    lcd.print(contadorCiclos);
+
+    // Linha 2 (índice 1): dd/mm/aa - HH:MM
+    char buf1[21];
+    sprintf(buf1, "%02d/%02d/%02d - %02d:%02d",
+            now.day(),
+            now.month(),
+            now.year() % 100,
+            now.hour(),
+            now.minute());
+    lcd.setCursor(2, 3);
+    lcd.print(buf1);
+    // limpa eventual sobra
+    for (uint8_t i = strlen(buf1); i < 20; i++) lcd.print(' ');
+
+    display_atualizou = false;
+  }
+}//----------------------------------------------
+
+void corrigirRTC() {
+
+  // só tenta NTP se o WiFi estiver conectado
+  if (WiFi.status() == WL_CONNECTED) {
+    // configura fuso para UTC–3 (Brasil)
+    configTime(-3 * 3600, 0, "pool.ntp.org");
+    delay(1000);  // deixa o NTP responder
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      // grava no DS3231 só quando tiver hora válida do NTP
+      rtc.adjust(DateTime(
+        timeinfo.tm_year + 1900,
+        timeinfo.tm_mon  + 1,
+        timeinfo.tm_mday,
+        timeinfo.tm_hour,
+        timeinfo.tm_min,
+        timeinfo.tm_sec
+      ));
+      Serial.println("RTC sincronizado com NTP.");
+    }
+    else {
+      Serial.println("Falha ao obter hora via NTP.");
+    }
+  }
+  else {
+    // sem WiFi, mantem o último horário já salvo no módulo
+    Serial.println("Sem conexão WiFi; mantendo hora do RTC.");
+  }
+}
+//----------------------------------------------
+void reconectarMqtt() {
+  // Tenta conectar só uma vez por chamada
+  if (clienteMqtt.connect(idClienteMqtt)) {
+    // Conectou! Se precisar, faça subscribe:
+    // clienteMqtt.subscribe("teu/topico");
+  }
+
+}//----------------------------------------------
+void monitoraMQTT(){
+
+   if(mqtt_estado_operacao){
+   // gera JSON com true/false e a vírgula entre campos
+  char estado_maq[20];
+  sprintf(estado_maq,
+    "{\"operacao\":%s}",
+    estado_operacao        ? "true" : "false"
+  );
+
+  clienteMqtt.publish(topicoEstado, estado_maq);
+   mqtt_estado_operacao = false;
+ }
+  if(contadorCiclos != contagem_anterior){
+  char jsonCiclo[30];
+  sprintf(jsonCiclo, "{\"ciclo\":%d}", contadorCiclos);
+  clienteMqtt.publish(topicoDados, jsonCiclo);
+  contagem_anterior = contadorCiclos;
+}
+if (enviaMQTT) {
+  // inverte lógica do botão NF: ativo quando LOW
+  bool emergAtivo = !estado_botao_emergencia;
+  bool porta_segurança_ativo = !estado_porta_seguranca;
+
+  // gera JSON com true/false e a vírgula entre campos
+  char falhas[80];
+  sprintf(falhas,
+    "{\"q01\":%s, \"bot.emergencia\":%s, \"porta\":%s}",
+    estado_disjuntor_motor        ? "true" : "false",
+    emergAtivo                    ? "true" : "false",
+    porta_segurança_ativo         ? "true" : "false"
+  );
+
+  clienteMqtt.publish(topicoFalhas, falhas);
+  enviaMQTT = false;
+}
+
+}//----------------------------------------------
+// Função para conectar Wifi e MQTT com timeout
+void conectarWiFiEMqtt() {
+
+  unsigned long inicio = millis();
+  lcd.clear(); lcd.setCursor(0,1);
+  lcd.print("  Conectando WiFi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(nomeRede, senhaRede);
+
+  // tenta Wi-Fi por até TIMEOUT_WIFI
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < TIMEOUT_WIFI) {
+
+
+    delay(1);
+  }
+  wifiConectado = (WiFi.status() == WL_CONNECTED);
+   lcd.clear();
+  lcd.setCursor(0,2);
+  if (wifiConectado) {
+
+    lcd.print("  IP:"); lcd.print(WiFi.localIP());
+    lcd.print("        Conectado!");
+    lcd.setCursor(0,3);
+    corrigirRTC();
+  } else {
+    lcd.print("    WiFi falhou!");
+  }
+
+  delay(1000);
+
+  // Se Wi-Fi conectar, configura e tenta MQTT por até TIMEOUT_MQTT
+  if (wifiConectado) {
+
+    // garante que o broker está configurado antes de connect()
+    clienteMqtt.setServer(servidorMqtt, portaMqtt);
+
+    inicio = millis();
+    lcd.clear(); lcd.setCursor(0,1);
+    lcd.print("Conectando Servidor");
+    while (!clienteMqtt.connected() && millis() - inicio < TIMEOUT_MQTT) {
+
+      clienteMqtt.connect(idClienteMqtt);
+
+      delay(1);
+    }
+    mqttConectado = clienteMqtt.connected();
+    lcd.setCursor(0,2);
+    if (mqttConectado) {
+      lcd.print("     Servidor OK");
+    } else {
+      lcd.print(" Falha ao Conectar!");
+      // desliga Wi-Fi de vez
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_MODE_NULL);
+    }
+
+    delay(1000);
+    lcd.clear();
+    lcd.setCursor(0,1);
+    lcd.print("Iniciando, Aguarde!");
+    lcd.setCursor(0,3);
+    lcd.print("               v:1.2");
+    delay(2000);
+  }
+}//----------------------------------------------
+// Página HTML de upload (OTA)
+const char* paginaHTML = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Atualização de Firmware</title>
+  <style>
+    body { margin:0; padding:0; font-family:Arial,sans-serif; background:#121212; color:#e0e0e0;
+      display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; text-align:center; }
+    h2 { color:#00ff88; margin-bottom:20px; }
+    input[type=file] { margin:15px 0; padding:10px; background:#333; color:#fff;
+      border:1px solid #555; border-radius:5px; width:80%; max-width:300px; }
+    input[type=submit] { background:#00ff88; color:#000; border:none;
+      padding:10px 20px; border-radius:5px; font-weight:bold; cursor:pointer; }
+    input[type=submit]:hover { background:#00cc66; }
+    footer { margin-top:25px; font-size:12px; color:#888; }
+  </style>
+</head>
+<body>
+  <h2>Atualização de Firmware</h2>
+  <form method="POST" action="/update" enctype="multipart/form-data">
+    <input type="file" name="update"><br>
+    <input type="submit" value="Enviar e Atualizar">
+  </form>
+  <footer>Consilos | Automação</footer>
+</body>
+</html>
+)rawliteral";
+//----------------------------------------------------------------
+void startOTA() {
+  // Cria o ponto de acesso
+  WiFi.disconnect(true);
+
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ota_ssid, ota_password);
+  Serial.println("[OTA] AP iniciado");
+  Serial.print("[OTA] Acesse: http://");
+  Serial.println(WiFi.softAPIP());
+  lcd.clear();
+  lcd.setCursor(0,1);
+  lcd.print("  MODO ATUALIZACAO");
+
+  // Rota root para servir o formulário
+  servidorOTA.on("/", HTTP_GET, []() {
+    servidorOTA.send(200, "text/html", paginaHTML);
+  });
+
+  // Rota de upload e resultado
+  servidorOTA.on("/update", HTTP_POST,
+    // Callback fim do upload
+    []() {
+      bool erro = Update.hasError();
+      String msg = erro ? "Falha na atualização!" : "Atualização concluída com sucesso!";
+      String cor = erro ? "#ff4444" : "#00ff88";
+      servidorOTA.send(200, "text/html",
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
+        "<title>Resultado OTA</title><style>body{margin:0;padding:0;font-family:Arial,sans-serif;"
+        "background:#121212;color:#e0e0e0;display:flex;flex-direction:column;align-items:center;"
+        "justify-content:center;height:100vh;text-align:center;}.msg{color:" + cor + ";font-size:24px;margin-bottom:10px;}</style></head><body>"
+        "<div class='msg'>" + msg + "</div><p>Reiniciando o dispositivo...</p></body></html>");
+      delay(1500);
+      ESP.restart();
+    },
+    // Callback durante o upload
+    []() {
+      HTTPUpload& upload = servidorOTA.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        if (!upload.filename.endsWith(".bin")) { Update.begin(0); return; }
+        Update.begin(UPDATE_SIZE_UNKNOWN);
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        Update.write(upload.buf, upload.currentSize);
+      } else if (upload.status == UPLOAD_FILE_END) {
+        Update.end(true);
+      }
+    }
+  );
+
+  servidorOTA.begin();
+}//-------------------------------------------------------------------------
+
+
