@@ -1,0 +1,12 @@
+#define LED PC13   // LED onboard da Bluepill
+
+void setup() {
+  pinMode(LED, OUTPUT);
+}
+
+void loop() {
+  digitalWrite(LED, LOW);   // LED ON (ativo em LOW)
+  delay(500);
+  digitalWrite(LED, HIGH);  // LED OFF
+  delay(500);
+}
